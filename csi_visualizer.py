@@ -230,26 +230,57 @@ def unpack_csi_payload(data):
 class CSIReceiver(threading.Thread):
     """Thread to receive CSI packets via UDP."""
     
-    def __init__(self, port, processor, verbose=False):
+    def __init__(self, port, processor, esp32_ip=None, verbose=False):
         super().__init__(daemon=True)
         self.port = port
         self.processor = processor
+        self.esp32_ip = esp32_ip
         self.verbose = verbose
         self.running = True
         self.sock = None
+        self.last_ping_time = 0
+        self.PING_INTERVAL = 10  # Send PING every 10 seconds
     
     def run(self):
         """Main receive loop."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('0.0.0.0', self.port))
         self.sock.settimeout(0.5)  # Timeout for clean shutdown
+        
+        # Send START command to ESP32 to begin CSI streaming
+        if self.esp32_ip:
+            print(f"Connecting to ESP32 at {self.esp32_ip}:{self.port}...")
+            try:
+                self.sock.sendto(b"START\n", (self.esp32_ip, self.port))
+                # Wait briefly for acknowledgment
+                try:
+                    self.sock.settimeout(2.0)
+                    ack, _ = self.sock.recvfrom(256)
+                    print(f"ESP32: {ack.decode().strip()}")
+                except socket.timeout:
+                    print("No acknowledgment received, continuing...")
+                self.sock.settimeout(0.5)
+                self.last_ping_time = time.time()
+            except Exception as e:
+                print(f"Failed to send START: {e}")
         
         print(f"CSI Receiver started on port {self.port}")
         
         while self.running:
             try:
+                # Send periodic PING to keep CSI stream alive
+                if self.esp32_ip and (time.time() - self.last_ping_time) > self.PING_INTERVAL:
+                    try:
+                        self.sock.sendto(b"PING\n", (self.esp32_ip, self.port))
+                        self.last_ping_time = time.time()
+                    except:
+                        pass
+                
                 data, addr = self.sock.recvfrom(2048)
+                
+                # Skip PONG responses
+                if data.strip() == b"PONG":
+                    continue
                 
                 packet = unpack_packet(data)
                 if packet and packet['type'] == PKT_TYPE_CSI and packet['payload']:
@@ -281,6 +312,13 @@ class CSIReceiver(threading.Thread):
     def stop(self):
         """Stop the receiver."""
         self.running = False
+        # Send STOP command to ESP32
+        if self.esp32_ip and self.sock:
+            try:
+                self.sock.sendto(b"STOP\n", (self.esp32_ip, self.port))
+                print("\nSent STOP to ESP32")
+            except:
+                pass
 
 
 class TrafficGenerator(threading.Thread):
@@ -579,22 +617,26 @@ The visualizer shows:
     
     # Create processor and receiver
     processor = CSIProcessor()
-    receiver = CSIReceiver(args.port, processor, verbose=args.verbose and not use_gui)
+    receiver = CSIReceiver(args.port, processor, esp32_ip=args.esp32, 
+                           verbose=args.verbose and not use_gui)
     
-    # Create traffic generator if ESP32 IP provided
+    # Create traffic generator if ESP32 IP provided (optional - ESP32 has built-in)
     traffic_gen = None
-    if args.esp32:
+    if args.esp32 and args.traffic_interval > 0:
         traffic_gen = TrafficGenerator(args.esp32, 3333, args.traffic_interval)
     
     print(f"ESP32 CSI Visualizer")
     print(f"=" * 50)
     print(f"Listening on UDP port: {args.port}")
+    if args.esp32:
+        print(f"ESP32 IP: {args.esp32} (will send START command)")
+    else:
+        print(f"ESP32 IP: Not specified (use --esp32 <IP> to connect)")
     print(f"Mode: {'GUI visualization' if use_gui else 'Console only'}")
     if traffic_gen:
         print(f"Traffic gen: Sending to {args.esp32}:3333 every {args.traffic_interval}ms")
     else:
-        print(f"Traffic gen: DISABLED (use --esp32 <IP> to enable)")
-        print(f"             (ESP32 has built-in traffic generator)")
+        print(f"Traffic gen: Using ESP32 built-in generator")
     print(f"=" * 50)
     
     # Start receiver thread

@@ -204,6 +204,48 @@ class ESP32Provisioner:
         """
         response = self._send_command("RESET")
         return response.startswith("OK")
+    
+    def reprovision(self) -> bool:
+        """
+        Restart ESP32 in provisioning mode (keeps credentials).
+        
+        Returns:
+            True if command was acknowledged
+        """
+        response = self._send_command("REPROVISION")
+        return response.startswith("OK")
+    
+    def reboot(self) -> bool:
+        """
+        Reboot the ESP32.
+        
+        Returns:
+            True if command was acknowledged
+        """
+        response = self._send_command("REBOOT")
+        return response.startswith("OK")
+    
+    def get_ssid(self) -> str:
+        """
+        Get currently connected SSID.
+        
+        Returns:
+            SSID string or error message
+        """
+        response = self._send_command("SSID")
+        if response.startswith("OK "):
+            return response[3:].strip()
+        return response.strip()
+    
+    def get_help(self) -> str:
+        """
+        Get available commands from server.
+        
+        Returns:
+            Help text
+        """
+        response = self._send_command("HELP")
+        return response.strip()
 
 
 def rssi_to_bars(rssi: int) -> str:
@@ -336,14 +378,19 @@ def interactive_mode(provisioner: ESP32Provisioner):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="ESP32 WiFi Provisioning Client",
+        description="ESP32 WiFi Provisioning and Control Client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                      # Connect to default 192.168.4.1:8080
-  %(prog)s 192.168.4.1          # Specify IP address
-  %(prog)s --scan               # Just scan and display networks
-  %(prog)s --connect "MyWiFi" "password123"  # Non-interactive connect
+  Provisioning mode (connect to ESP32_CSI_Setup AP first):
+    %(prog)s                      # Connect to default 192.168.4.1:8080
+    %(prog)s --scan               # Just scan and display networks
+    %(prog)s --connect "MyWiFi" "password123"  # Non-interactive connect
+  
+  Control mode (ESP32 connected to your network):
+    %(prog)s 192.168.1.100 --status    # Check status on STA IP
+    %(prog)s 192.168.1.100 --reset     # Reset credentials remotely
+    %(prog)s 192.168.1.100 --reprovision  # Restart in provisioning mode
 """
     )
     
@@ -352,13 +399,17 @@ Examples:
     parser.add_argument("--port", "-p", type=int, default=DEFAULT_TCP_PORT,
                         help=f"TCP port (default: {DEFAULT_TCP_PORT})")
     parser.add_argument("--scan", "-s", action="store_true",
-                        help="Scan for networks and exit")
+                        help="Scan for networks and exit (provisioning mode)")
     parser.add_argument("--connect", "-c", nargs=2, metavar=("SSID", "PASSWORD"),
-                        help="Connect to network (non-interactive)")
+                        help="Connect to network (provisioning mode)")
     parser.add_argument("--status", action="store_true",
                         help="Check connection status and exit")
     parser.add_argument("--reset", action="store_true",
                         help="Reset credentials and reboot ESP32")
+    parser.add_argument("--reprovision", action="store_true",
+                        help="Restart ESP32 in provisioning mode (keeps credentials)")
+    parser.add_argument("--reboot", action="store_true",
+                        help="Reboot the ESP32")
     
     args = parser.parse_args()
     
@@ -366,13 +417,22 @@ Examples:
     provisioner = ESP32Provisioner(args.host, args.port)
     
     print(f"Connecting to ESP32 at {args.host}:{args.port}...")
-    print("(Make sure you're connected to the ESP32_CSI_Setup WiFi network)\n")
+    
+    # Show appropriate hint based on IP address
+    if args.host == DEFAULT_ESP32_IP:
+        print("(Make sure you're connected to the ESP32_CSI_Setup WiFi network)\n")
+    else:
+        print("(Connecting to ESP32 on your network)\n")
     
     if not provisioner.connect():
-        print("\nFailed to connect to ESP32 provisioning server.")
+        print("\nFailed to connect to ESP32.")
         print("Make sure:")
-        print("  1. You're connected to the ESP32_CSI_Setup WiFi network")
-        print("  2. The ESP32 is in provisioning mode")
+        if args.host == DEFAULT_ESP32_IP:
+            print("  1. You're connected to the ESP32_CSI_Setup WiFi network")
+            print("  2. The ESP32 is in provisioning mode")
+        else:
+            print("  1. The ESP32 is connected to your network")
+            print("  2. The ESP32 control server is running")
         print(f"  3. The IP address {args.host} is correct")
         sys.exit(1)
     
@@ -407,6 +467,25 @@ Examples:
                 print("ESP32 is rebooting with credentials cleared.")
             else:
                 print("Reset failed.")
+                sys.exit(1)
+                
+        elif args.reprovision:
+            # Restart in provisioning mode
+            print("Requesting provisioning mode restart...")
+            if provisioner.reprovision():
+                print("ESP32 is restarting in provisioning mode.")
+                print("Connect to the ESP32_CSI_Setup WiFi network to configure.")
+            else:
+                print("Reprovision request failed.")
+                sys.exit(1)
+                
+        elif args.reboot:
+            # Reboot the device
+            print("Rebooting ESP32...")
+            if provisioner.reboot():
+                print("ESP32 is rebooting.")
+            else:
+                print("Reboot request failed.")
                 sys.exit(1)
                 
         else:

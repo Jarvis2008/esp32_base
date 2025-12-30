@@ -31,6 +31,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_http_server.h"
+#include "esp_rom_sys.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include <sys/socket.h>
@@ -57,8 +58,11 @@
 /** UDP port for CSI data streaming */
 #define UDP_CSI_PORT 3334
 
-/** TCP port for provisioning server */
+/** TCP port for provisioning server (AP mode) */
 #define TCP_PROVISION_PORT 8080
+
+/** TCP port for control server (STA mode - same port, different mode) */
+#define TCP_CONTROL_PORT 8080
 
 /** HTTP port for web interface */
 #define HTTP_PORT 80
@@ -135,9 +139,6 @@ static RingbufHandle_t csi_ringbuf = NULL;
 /** UDP socket for CSI streaming (initialized in csi_stream_task) */
 static int udp_sock = -1;
 
-/** Destination address for CSI UDP packets */
-static struct sockaddr_in csi_dest_addr;
-
 /** Last CSI capture timestamp for rate limiting (in microseconds) */
 static volatile int64_t last_csi_time = 0;
 
@@ -175,10 +176,10 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
-    uint64_t timestamp;
-    int8_t rssi;
-    uint8_t channel;
-    uint8_t len;
+	uint64_t timestamp;
+	int8_t rssi;
+	uint8_t channel;
+	uint8_t len;
     int8_t data[MAX_CSI_LEN];
 } csi_payload_t;
 
@@ -189,11 +190,13 @@ typedef struct {
 void csi_stream_task(void *pvParameters);
 void traffic_generator_task(void *pvParameters);
 void tcp_provision_task(void *pvParameters);
+void tcp_control_task(void *pvParameters);
 static esp_err_t start_http_server(void);
 static void stop_http_server(void);
 static bool wifi_connect_sta(const char *ssid, const char *password);
 static void start_provisioning_mode(void);
 static void stop_provisioning_mode(void);
+static void restart_for_provisioning(void);
 
 /*===========================================================================*/
 /*                          NVS FUNCTIONS                                     */
@@ -371,12 +374,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 /*                          CSI FUNCTIONS                                     */
 /*===========================================================================*/
 
+/** Flag to log first CSI packet */
+static volatile bool first_csi_logged = false;
+
 /**
  * @brief WiFi CSI callback function
  */
 void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
 {
-    if (!info || !info->buf || !csi_ringbuf) return;
+    if (!info || !info->buf) return;
+    
+    /* Check if ring buffer is available */
+    if (!csi_ringbuf) {
+        return;
+    }
     
     int64_t now = esp_timer_get_time();
     
@@ -391,6 +402,14 @@ void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     last_csi_time = now;
     csi_captured_count++;
     
+    /* Log first CSI packet for debugging */
+    if (!first_csi_logged) {
+        first_csi_logged = true;
+        /* Note: This log from ISR context may not always work, but worth trying */
+        esp_rom_printf("CSI: First packet received! len=%d rssi=%d ch=%d\n", 
+                   info->len, info->rx_ctrl.rssi, info->rx_ctrl.channel);
+    }
+    
     csi_payload_t payload = {0};
     payload.timestamp = now;
     payload.rssi = info->rx_ctrl.rssi;
@@ -403,36 +422,80 @@ void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         csi_dropped_count++;
     }
 }
-
+ 
 /**
  * @brief Start CSI capture and streaming tasks
  */
+/** Promiscuous mode callback (required for CSI on some ESP-IDF versions) */
+static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    /* We don't need to process packets here, just having promiscuous mode 
+     * enabled is enough for CSI to work */
+    (void)buf;
+    (void)type;
+}
+
 static void start_csi_streaming(void)
 {
-    ESP_LOGI(TAG, "Starting CSI streaming...");
+    ESP_LOGI(TAG, "Starting CSI streaming tasks...");
     
-    /* Configure CSI */
+    /* Enable promiscuous mode (required for CSI to work) */
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_cb));
+    
+    /* Configure promiscuous filter to capture all frames */
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
+    ESP_LOGI(TAG, "Promiscuous mode enabled for CSI");
+    
+    /* Fully reconfigure CSI to ensure it's working */
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
         .htltf_en = true,
-        .stbc_htltf2_en = true,
+        .stbc_htltf2_en = false,  /* Disable to reduce "unknown csi bug" warnings */
         .ltf_merge_en = true,
         .channel_filter_en = false,
         .manu_scale = false,
         .shift = false,
     };
     
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
-    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    esp_err_t err = esp_wifi_set_csi_config(&csi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set CSI config: %s", esp_err_to_name(err));
+    }
+    
+    err = esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set CSI callback: %s", esp_err_to_name(err));
+    }
+    
+    err = esp_wifi_set_csi(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable CSI: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "CSI enabled successfully");
+    }
+    
+    /* Reset the first CSI logged flag */
+    first_csi_logged = false;
     
     /* Start CSI streaming task */
     xTaskCreatePinnedToCore(csi_stream_task, "csi_stream", 4096, NULL, 5, NULL, 1);
+    ESP_LOGI(TAG, "CSI stream task started");
     
-    /* Start traffic generator */
+    /* Start traffic generator to ensure continuous CSI capture */
 #if TRAFFIC_GEN_INTERVAL_MS > 0
-    xTaskCreatePinnedToCore(traffic_generator_task, "traffic_gen", 2048, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(traffic_generator_task, "traffic_gen", 4096, NULL, 4, NULL, 0);
+    ESP_LOGI(TAG, "Traffic generator task started");
+#else
+    ESP_LOGW(TAG, "Traffic generator disabled (TRAFFIC_GEN_INTERVAL_MS=0)");
 #endif
+    
+    /* Start TCP control server for remote management */
+    xTaskCreatePinnedToCore(tcp_control_task, "tcp_ctrl", 4096, NULL, 4, NULL, 0);
+    ESP_LOGI(TAG, "TCP control server task started");
 }
 
 /*===========================================================================*/
@@ -455,7 +518,7 @@ static uint16_t wifi_scan(void)
         .scan_time.active.min = 100,
         .scan_time.active.max = 300,
     };
-    
+
     ESP_LOGI(TAG, "Starting WiFi scan...");
     
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
@@ -589,6 +652,21 @@ static void wifi_init_apsta(void)
     /* Start WiFi */
     ESP_ERROR_CHECK(esp_wifi_start());
     
+    /* Configure and enable CSI early (must be done after esp_wifi_start) */
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = false,  /* Disable to reduce "unknown csi bug" warnings */
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = false,
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    ESP_LOGI(TAG, "CSI capture enabled");
+    
     ESP_LOGI(TAG, "WiFi initialized in APSTA mode");
     ESP_LOGI(TAG, "AP SSID: %s, Password: %s", AP_SSID, AP_PASS);
     ESP_LOGI(TAG, "AP IP: 192.168.4.1");
@@ -606,6 +684,21 @@ static void wifi_switch_to_sta_only(void)
     
     /* Switch to STA mode only */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    
+    /* Re-enable CSI after mode switch (settings may be lost) */
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = false,  /* Disable to reduce "unknown csi bug" warnings */
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = false,
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    ESP_LOGI(TAG, "CSI re-enabled after mode switch");
     
     is_provisioning = false;
     ESP_LOGI(TAG, "Now in STA-only mode");
@@ -1185,61 +1278,379 @@ void tcp_provision_task(void *pvParameters)
 }
 
 /*===========================================================================*/
-/*                          TASK FUNCTIONS                                    */
+/*                          TCP CONTROL SERVER (STA MODE)                     */
 /*===========================================================================*/
 
 /**
+ * @brief Restart ESP32 for provisioning mode
+ * 
+ * Clears the "skip_auto_connect" flag and reboots to enter provisioning mode
+ */
+static void restart_for_provisioning(void)
+{
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_u8(nvs_handle, "force_prov", 1);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Restarting for provisioning...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+/**
+ * @brief Handle control client connection (STA mode)
+ * 
+ * Commands:
+ * - STATUS: Return connection status and IP
+ * - RESET: Clear credentials and reboot
+ * - REPROVISION: Keep credentials but restart in provisioning mode
+ * - SSID: Return currently connected SSID
+ */
+static void handle_control_client(int sock)
+{
+    char rx_buffer[256];
+    char tx_buffer[512];
+    
+    while (sta_connected) {
+        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Control recv error: errno %d", errno);
+            break;
+        } else if (len == 0) {
+            ESP_LOGI(TAG, "Control client disconnected");
+            break;
+        }
+        
+        rx_buffer[len] = '\0';
+        
+        /* Remove trailing newlines */
+        while (len > 0 && (rx_buffer[len-1] == '\n' || rx_buffer[len-1] == '\r')) {
+            rx_buffer[--len] = '\0';
+        }
+        
+        ESP_LOGI(TAG, "Control received: %s", rx_buffer);
+        
+        if (strncmp(rx_buffer, "STATUS", 6) == 0) {
+            esp_netif_ip_info_t ip_info;
+            esp_netif_get_ip_info(sta_netif, &ip_info);
+            char ip_str[16];
+            esp_ip4addr_ntoa(&ip_info.ip, ip_str, sizeof(ip_str));
+            
+            /* Get connected SSID */
+            wifi_ap_record_t ap_info;
+            char ssid_str[33] = "Unknown";
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                strncpy(ssid_str, (char *)ap_info.ssid, sizeof(ssid_str) - 1);
+            }
+            
+            snprintf(tx_buffer, sizeof(tx_buffer), 
+                "OK CONNECTED\nIP: %s\nSSID: %s\nRSSI: %d dBm\nCSI Port: %d\nControl Port: %d\n",
+                ip_str, ssid_str, ap_info.rssi, UDP_CSI_PORT, TCP_CONTROL_PORT);
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            
+        } else if (strncmp(rx_buffer, "RESET", 5) == 0) {
+            nvs_clear_wifi_credentials();
+            snprintf(tx_buffer, sizeof(tx_buffer), "OK Credentials cleared. Rebooting...\n");
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+            
+        } else if (strncmp(rx_buffer, "REPROVISION", 11) == 0) {
+            snprintf(tx_buffer, sizeof(tx_buffer), "OK Restarting in provisioning mode...\n");
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            restart_for_provisioning();
+            
+        } else if (strncmp(rx_buffer, "SSID", 4) == 0) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                snprintf(tx_buffer, sizeof(tx_buffer), "OK %s\n", ap_info.ssid);
+            } else {
+                snprintf(tx_buffer, sizeof(tx_buffer), "ERR Not connected\n");
+            }
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            
+        } else if (strncmp(rx_buffer, "REBOOT", 6) == 0) {
+            snprintf(tx_buffer, sizeof(tx_buffer), "OK Rebooting...\n");
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+            
+        } else if (strncmp(rx_buffer, "HELP", 4) == 0 || len == 0) {
+            snprintf(tx_buffer, sizeof(tx_buffer), 
+                "Available commands:\n"
+                "  STATUS      - Show connection status\n"
+                "  SSID        - Show connected network name\n"
+                "  RESET       - Clear WiFi credentials and reboot\n"
+                "  REPROVISION - Restart in provisioning mode (keep credentials)\n"
+                "  REBOOT      - Reboot the device\n"
+                "  HELP        - Show this help\n");
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+            
+        } else {
+            snprintf(tx_buffer, sizeof(tx_buffer), 
+                "ERR Unknown command. Type HELP for available commands.\n");
+            send(sock, tx_buffer, strlen(tx_buffer), 0);
+        }
+    }
+    
+    close(sock);
+}
+
+/**
+ * @brief TCP control server task (runs in STA mode)
+ * 
+ * Listens for control connections when ESP32 is connected to WiFi
+ */
+void tcp_control_task(void *pvParameters)
+{
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(TCP_CONTROL_PORT),
+    };
+    
+    int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (listen_sock < 0) {
+        ESP_LOGE(TAG, "Control: Failed to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    if (bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "Control: Failed to bind: errno %d", errno);
+        close(listen_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    if (listen(listen_sock, 2) < 0) {
+        ESP_LOGE(TAG, "Control: Failed to listen: errno %d", errno);
+        close(listen_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    /* Get our IP address for logging */
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(sta_netif, &ip_info);
+    char ip_str[16];
+    esp_ip4addr_ntoa(&ip_info.ip, ip_str, sizeof(ip_str));
+    
+    ESP_LOGI(TAG, "TCP control server listening on %s:%d", ip_str, TCP_CONTROL_PORT);
+    
+    /* Set socket timeout for clean handling */
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(listen_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    while (sta_connected) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_sock < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Control: Accept failed: errno %d", errno);
+            continue;
+        }
+        
+        char addr_str[16];
+        inet_ntoa_r(client_addr.sin_addr, addr_str, sizeof(addr_str));
+        ESP_LOGI(TAG, "Control: Client connected from %s", addr_str);
+        
+        /* Send welcome message */
+        const char *welcome = "ESP32 CSI Control Server\nType HELP for commands\n";
+        send(client_sock, welcome, strlen(welcome), 0);
+        
+        /* Set timeout for client socket */
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        handle_control_client(client_sock);
+    }
+    
+    close(listen_sock);
+    ESP_LOGI(TAG, "TCP control server stopped");
+    vTaskDelete(NULL);
+}
+
+/*===========================================================================*/
+/*                          TASK FUNCTIONS                                    */
+/*===========================================================================*/
+
+/** Client timeout in seconds (stop streaming if no keepalive) */
+#define CSI_CLIENT_TIMEOUT_SEC 30
+
+/** Flag indicating if a CSI client is connected */
+static volatile bool csi_client_connected = false;
+static struct sockaddr_in csi_client_addr;
+static volatile int64_t csi_client_last_seen = 0;
+
+/**
  * @brief CSI Streaming Task
+ * 
+ * Listens for client connections on UDP port 3334.
+ * Commands:
+ *   START - Register client and begin streaming CSI data
+ *   STOP  - Unregister client and stop streaming
+ *   PING  - Keepalive (resets timeout)
+ * 
+ * Streaming stops automatically after CSI_CLIENT_TIMEOUT_SEC of no messages.
  */
 void csi_stream_task(void *pvParameters)
 {
     const size_t required_buffer_size = sizeof(packet_t) + sizeof(csi_payload_t);
     uint8_t buffer[required_buffer_size + 16];
+    char rx_buffer[64];
     
+    /* Create UDP socket */
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (udp_sock < 0) {
         ESP_LOGE(TAG, "CSI: Unable to create UDP socket: errno %d", errno);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "CSI: UDP socket created for streaming");
     
-    /* Enable broadcast */
-    int broadcast = 1;
-    setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    /* Bind to CSI port to receive commands */
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(UDP_CSI_PORT),
+    };
     
-    memset(&csi_dest_addr, 0, sizeof(csi_dest_addr));
-    csi_dest_addr.sin_family = AF_INET;
-    csi_dest_addr.sin_port = htons(UDP_CSI_PORT);
-    
-    if (strcmp(CSI_DEST_IP_ADDR, "255.255.255.255") == 0) {
-        csi_dest_addr.sin_addr.s_addr = INADDR_BROADCAST;
-    } else {
-        csi_dest_addr.sin_addr.s_addr = inet_addr(CSI_DEST_IP_ADDR);
+    if (bind(udp_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "CSI: Failed to bind UDP socket: errno %d", errno);
+        close(udp_sock);
+        vTaskDelete(NULL);
+        return;
     }
     
-    ESP_LOGI(TAG, "CSI: Streaming to %s:%d (rate limit: %d ms)", 
-             CSI_DEST_IP_ADDR, UDP_CSI_PORT, CSI_MIN_INTERVAL_MS);
+    /* Set socket to non-blocking with timeout */
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms timeout */
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    ESP_LOGI(TAG, "CSI: Listening on UDP port %d (send 'START' to begin streaming)", UDP_CSI_PORT);
     
     uint32_t sent_count = 0;
     int64_t last_stats_time = esp_timer_get_time();
     const int64_t STATS_INTERVAL_US = 5000000;
     
     while (1) {
-        size_t item_size;
-        
         int64_t now = esp_timer_get_time();
+        
+        /* Check for client timeout */
+        if (csi_client_connected) {
+            int64_t elapsed_sec = (now - csi_client_last_seen) / 1000000;
+            if (elapsed_sec > CSI_CLIENT_TIMEOUT_SEC) {
+                ESP_LOGW(TAG, "CSI: Client timeout, stopping stream");
+                csi_client_connected = false;
+            }
+        }
+        
+        /* Check for incoming commands */
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int len = recvfrom(udp_sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                          (struct sockaddr *)&client_addr, &addr_len);
+        
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            
+            /* Remove trailing newlines */
+            while (len > 0 && (rx_buffer[len-1] == '\n' || rx_buffer[len-1] == '\r')) {
+                rx_buffer[--len] = '\0';
+            }
+            
+            char client_ip[16];
+            inet_ntoa_r(client_addr.sin_addr, client_ip, sizeof(client_ip));
+            
+            if (strncasecmp(rx_buffer, "START", 5) == 0) {
+                /* Register client and start streaming */
+                memcpy(&csi_client_addr, &client_addr, sizeof(client_addr));
+                csi_client_connected = true;
+                csi_client_last_seen = now;
+                ESP_LOGI(TAG, "CSI: Client %s:%d connected, streaming started", 
+                         client_ip, ntohs(client_addr.sin_port));
+                
+                /* Send acknowledgment */
+                const char *ack = "OK CSI streaming started\n";
+                sendto(udp_sock, ack, strlen(ack), 0, 
+                       (struct sockaddr *)&client_addr, sizeof(client_addr));
+                       
+            } else if (strncasecmp(rx_buffer, "STOP", 4) == 0) {
+                /* Stop streaming */
+                csi_client_connected = false;
+                ESP_LOGI(TAG, "CSI: Client %s requested stop", client_ip);
+                
+                const char *ack = "OK CSI streaming stopped\n";
+                sendto(udp_sock, ack, strlen(ack), 0, 
+                       (struct sockaddr *)&client_addr, sizeof(client_addr));
+                       
+            } else if (strncasecmp(rx_buffer, "PING", 4) == 0) {
+                /* Keepalive */
+                if (csi_client_connected && 
+                    client_addr.sin_addr.s_addr == csi_client_addr.sin_addr.s_addr) {
+                    csi_client_last_seen = now;
+                }
+                const char *ack = "PONG\n";
+                sendto(udp_sock, ack, strlen(ack), 0, 
+                       (struct sockaddr *)&client_addr, sizeof(client_addr));
+                       
+            } else if (strncasecmp(rx_buffer, "STATUS", 6) == 0) {
+                /* Status query */
+                char status[128];
+                if (csi_client_connected) {
+                    char connected_ip[16];
+                    inet_ntoa_r(csi_client_addr.sin_addr, connected_ip, sizeof(connected_ip));
+                    snprintf(status, sizeof(status), "STREAMING to %s:%d\n", 
+                             connected_ip, ntohs(csi_client_addr.sin_port));
+                } else {
+                    snprintf(status, sizeof(status), "IDLE (send START to begin)\n");
+                }
+                sendto(udp_sock, status, strlen(status), 0, 
+                       (struct sockaddr *)&client_addr, sizeof(client_addr));
+            }
+        }
+        
+        /* Log stats periodically */
         if ((now - last_stats_time) >= STATS_INTERVAL_US) {
             float elapsed_sec = (now - last_stats_time) / 1000000.0f;
-            ESP_LOGI(TAG, "CSI Stats: sent=%lu, captured=%lu, dropped=%lu, rate=%.1f pkt/s",
-                     sent_count, csi_captured_count, csi_dropped_count,
-                     sent_count / elapsed_sec);
+            if (csi_client_connected) {
+                ESP_LOGI(TAG, "CSI Stats: sent=%lu, captured=%lu, dropped=%lu, rate=%.1f pkt/s",
+                         sent_count, csi_captured_count, csi_dropped_count,
+                         sent_count / elapsed_sec);
+            } else {
+                ESP_LOGI(TAG, "CSI: Waiting for client (captured=%lu, port=%d)", 
+                         csi_captured_count, UDP_CSI_PORT);
+            }
             sent_count = 0;
             last_stats_time = now;
         }
         
+        /* Only stream if client is connected */
+        if (!csi_client_connected) {
+            /* Drain the ring buffer to prevent overflow */
+            size_t item_size;
+            void *item = xRingbufferReceive(csi_ringbuf, &item_size, 0);
+            if (item) {
+                vRingbufferReturnItem(csi_ringbuf, item);
+            }
+            continue;
+        }
+        
+        /* Send CSI data to connected client */
+        size_t item_size;
         csi_payload_t *payload = (csi_payload_t *)xRingbufferReceive(
-            csi_ringbuf, &item_size, pdMS_TO_TICKS(100));
+            csi_ringbuf, &item_size, pdMS_TO_TICKS(10));
         
         if (payload) {
             if (item_size != sizeof(csi_payload_t)) {
@@ -1257,7 +1668,7 @@ void csi_stream_task(void *pvParameters)
             memcpy(pkt->payload, payload, sizeof(csi_payload_t));
             
             int sent = sendto(udp_sock, buffer, required_buffer_size, 0,
-                             (struct sockaddr *)&csi_dest_addr, sizeof(csi_dest_addr));
+                             (struct sockaddr *)&csi_client_addr, sizeof(csi_client_addr));
             
             if (sent > 0) {
                 sent_count++;
@@ -1277,6 +1688,9 @@ void csi_stream_task(void *pvParameters)
 void traffic_generator_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Traffic generator started (interval: %d ms)", TRAFFIC_GEN_INTERVAL_MS);
+    
+    /* Small delay to ensure network is fully ready */
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
@@ -1303,13 +1717,27 @@ void traffic_generator_task(void *pvParameters)
     
     char gw_str[16];
     esp_ip4addr_ntoa(&ip_info.gw, gw_str, sizeof(gw_str));
-    ESP_LOGI(TAG, "Traffic gen: Sending to gateway %s", gw_str);
+    ESP_LOGI(TAG, "Traffic gen: Sending to gateway %s:%d", gw_str, 12345);
     
-    uint8_t ping_data[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    uint8_t ping_data[32] = {0xDE, 0xAD, 0xBE, 0xEF};  /* Larger packet for better CSI */
+    uint32_t send_count = 0;
+    int64_t last_log_time = esp_timer_get_time();
     
     while (1) {
-        sendto(sock, ping_data, sizeof(ping_data), 0,
+        int sent = sendto(sock, ping_data, sizeof(ping_data), 0,
                (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        
+        if (sent > 0) {
+            send_count++;
+        }
+        
+        /* Log every 10 seconds */
+        int64_t now = esp_timer_get_time();
+        if ((now - last_log_time) >= 10000000) {  /* 10 seconds */
+            ESP_LOGI(TAG, "Traffic gen: sent %lu packets to gateway", send_count);
+            last_log_time = now;
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(TRAFFIC_GEN_INTERVAL_MS));
     }
     
@@ -1338,20 +1766,35 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "CSI ring buffer created (%d bytes)", ringbuf_size);
-    
+
     /* Initialize WiFi in APSTA mode */
     wifi_init_apsta();
     
-    /* Try to load saved credentials */
+    /* Check if we were asked to force provisioning mode */
+    bool force_provisioning = false;
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        uint8_t force_prov = 0;
+        if (nvs_get_u8(nvs_handle, "force_prov", &force_prov) == ESP_OK && force_prov == 1) {
+            ESP_LOGI(TAG, "Force provisioning flag detected");
+            force_provisioning = true;
+            /* Clear the flag */
+            nvs_erase_key(nvs_handle, "force_prov");
+            nvs_commit(nvs_handle);
+        }
+        nvs_close(nvs_handle);
+    }
+    
+    /* Try to load saved credentials (unless force provisioning) */
     char saved_ssid[MAX_SSID_LEN] = {0};
     char saved_pass[MAX_PASS_LEN] = {0};
     
-    if (nvs_load_wifi_credentials(saved_ssid, saved_pass) == ESP_OK) {
+    if (!force_provisioning && nvs_load_wifi_credentials(saved_ssid, saved_pass) == ESP_OK) {
         ESP_LOGI(TAG, "Found saved credentials, attempting auto-connect...");
         
         if (wifi_connect_sta(saved_ssid, saved_pass)) {
             ESP_LOGI(TAG, "Auto-connect successful!");
-            
+
             /* Switch to STA-only mode and start CSI */
             wifi_switch_to_sta_only();
             start_csi_streaming();
@@ -1364,7 +1807,7 @@ void app_main(void)
             ESP_LOGW(TAG, "Auto-connect failed, starting provisioning mode...");
         }
     }
-    
+
     /* No saved credentials or auto-connect failed - start provisioning */
     start_provisioning_mode();
     
@@ -1377,3 +1820,5 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
+
+

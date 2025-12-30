@@ -27,6 +27,7 @@ CSI payload structure (when type is PKT_TYPE_CSI):
 import socket
 import struct
 import sys
+import time
 from datetime import datetime
 
 # Packet constants (must match esp32_base.c definitions)
@@ -254,7 +255,7 @@ def main():
     print(f"Connecting to ESP32 at {esp32_ip}:{port} ({mode_str})")
     
     if use_csi:
-        print("Listening for CSI data packets...")
+        print("Connecting to ESP32 for CSI streaming...")
     else:
         print("Send any message to trigger ESP32 response...")
     print("Press Ctrl+C to exit\n")
@@ -263,13 +264,25 @@ def main():
         # Create UDP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        # For CSI mode, bind to receive packets (broadcast or unicast)
+        # For CSI mode, send START command to begin streaming
         if use_csi:
-            # Bind to all interfaces (0.0.0.0) to receive packets sent to our IP or broadcast
-            sock.bind(('0.0.0.0', port))
-            # Enable SO_REUSEADDR to allow binding even if port is in use
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            print(f"Bound to port {port} for CSI reception (listening on all interfaces)")
+            # Set timeout for receiving
+            sock.settimeout(2.0)
+            
+            # Send START command to ESP32
+            print(f"Sending START command to {esp32_ip}:{port}...")
+            sock.sendto(b"START\n", (esp32_ip, port))
+            
+            # Wait for acknowledgment
+            try:
+                ack_data, ack_addr = sock.recvfrom(256)
+                print(f"ESP32 response: {ack_data.decode().strip()}")
+            except socket.timeout:
+                print("Warning: No acknowledgment received, continuing anyway...")
+            
+            # Set shorter timeout for main loop
+            sock.settimeout(1.0)
+            print(f"CSI streaming started from {esp32_ip}:{port}")
         else:
             # Set socket timeout (optional, but useful for responsiveness)
             sock.settimeout(1.0)
@@ -282,13 +295,25 @@ def main():
         packet_count = 0
         csi_count = 0
         heartbeat_count = 0
+        last_ping_time = time.time()
+        PING_INTERVAL = 10  # Send PING every 10 seconds to keep connection alive
         
         # Main receive loop
         while True:
             try:
+                # Send periodic PING to keep CSI stream alive
+                if use_csi and (time.time() - last_ping_time) > PING_INTERVAL:
+                    sock.sendto(b"PING\n", (esp32_ip, port))
+                    last_ping_time = time.time()
+                
                 # Receive data from ESP32 (larger buffer for CSI packets)
                 buffer_size = 2048 if use_csi else 1024
                 data, addr = sock.recvfrom(buffer_size)
+                
+                # Skip PONG responses from our PINGs
+                if data.strip() == b"PONG":
+                    continue
+                    
                 packet_count += 1
                 
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received {len(data)} bytes from {addr[0]}:{addr[1]}")
@@ -338,6 +363,13 @@ def main():
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     finally:
+        # Send STOP command if in CSI mode
+        if use_csi:
+            try:
+                print("Sending STOP command...")
+                sock.sendto(b"STOP\n", (esp32_ip, port))
+            except:
+                pass
         sock.close()
         print("Socket closed")
 
